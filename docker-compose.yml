@@ -1,0 +1,24 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: auto-sign-redis
+    restart: always
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+
+  app:
+    build: .
+    container_name: auto-sign-app
+    restart: always
+    depends_on:
+      - redis
+    environment:
+      - REDIS_HOST=redis
+    volumes:
+      - ./config.json:/app/config.json
+      - ./queue.json:/app/queue.json
+
+volumes:
+  redis_data:
