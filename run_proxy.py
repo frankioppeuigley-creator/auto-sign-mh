@@ -1,5 +1,7 @@
 import hashlib
 import json
+import logging
+import logging.handlers
 import os
 import random
 import sys
@@ -14,6 +16,78 @@ from email.mime.text import MIMEText
 
 # 中国时区
 CST = timezone(timedelta(hours=8))
+
+# 日志配置
+LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+
+class DailyRotatingFileHandler(logging.FileHandler):
+    """每日生成一个日志文件，格式: run_proxy_2026_07_02.log"""
+
+    def __init__(self, log_dir, prefix="run_proxy", encoding="utf-8"):
+        self.log_dir = log_dir
+        self.prefix = prefix
+        self.current_date = None
+        super().__init__(self._get_log_file_path(), encoding=encoding)
+
+    def _get_log_file_path(self):
+        today = datetime.now(CST).strftime("%Y_%m_%d")
+        return os.path.join(self.log_dir, f"{self.prefix}_{today}.log")
+
+    def emit(self, record):
+        today = datetime.now(CST).strftime("%Y_%m_%d")
+        if today != self.current_date:
+            self.current_date = today
+            self.baseFilename = self._get_log_file_path()
+            if self.stream:
+                self.stream.close()
+            self.stream = self._open()
+        super().emit(record)
+
+
+# 日志保留天数
+LOG_RETENTION_DAYS = 7
+
+
+def cleanup_old_logs():
+    """清理超过保留天数的日志文件"""
+    now = datetime.now(CST)
+    cutoff = now - timedelta(days=LOG_RETENTION_DAYS)
+    cutoff_str = cutoff.strftime("%Y_%m_%d")
+
+    try:
+        for filename in os.listdir(LOG_DIR):
+            if filename.startswith("run_proxy_") and filename.endswith(".log"):
+                # 提取日期部分: run_proxy_2026_07_02.log -> 2026_07_02
+                date_str = filename[10:-4]
+                if date_str < cutoff_str:
+                    filepath = os.path.join(LOG_DIR, filename)
+                    os.remove(filepath)
+                    logger.info(f"已清理旧日志: {filename}")
+    except Exception as e:
+        logger.error(f"清理日志失败: {e}")
+
+
+# 创建 logger
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# 控制台 Handler
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+
+# 文件 Handler（每日轮转）
+file_handler = DailyRotatingFileHandler(LOG_DIR, prefix="run_proxy")
+file_handler.setLevel(logging.INFO)
+
+# 日志格式
+formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+console_handler.setFormatter(formatter)
+file_handler.setFormatter(formatter)
+
+logger.addHandler(console_handler)
+logger.addHandler(file_handler)
 
 # ====== 全局配置 ======
 BASE_URL = "https://meihao.v3.api.meihaocvs.com/api"
@@ -39,7 +113,13 @@ REDIS_PORT = int(os.environ.get("REDIS_PORT", 6379))
 REDIS_DB = int(os.environ.get("REDIS_DB", 0))
 
 # Redis 连接池
-redis_pool = redis.ConnectionPool(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True)
+redis_pool = redis.ConnectionPool(
+    host=REDIS_HOST,
+    port=REDIS_PORT,
+    db=REDIS_DB,
+    decode_responses=True,
+    max_connections=10,
+)
 
 
 def get_redis():
@@ -72,15 +152,27 @@ def get_day_window():
 def get_retry_window():
     """获取重试缓冲区时间窗口 (23:30 - 次日02:00)"""
     now = now_cst()
-    start = now.replace(hour=DAY_END_HOUR, minute=DAY_END_MINUTE, second=0, microsecond=0)
-    end = (now + timedelta(days=1)).replace(hour=RETRY_END_HOUR, minute=0, second=0, microsecond=0)
+    retry_end_today = now.replace(hour=RETRY_END_HOUR, minute=0, second=0, microsecond=0)
+
+    if now < retry_end_today:
+        # 当前时间在 00:00-01:59，重试窗口是昨天 23:30 到今天 02:00
+        start = (now - timedelta(days=1)).replace(hour=DAY_END_HOUR, minute=DAY_END_MINUTE, second=0, microsecond=0)
+        end = retry_end_today
+    else:
+        # 当前时间在 02:00 之后，重试窗口是今天 23:30 到明天 02:00
+        start = now.replace(hour=DAY_END_HOUR, minute=DAY_END_MINUTE, second=0, microsecond=0)
+        end = (now + timedelta(days=1)).replace(hour=RETRY_END_HOUR, minute=0, second=0, microsecond=0)
+
     return start, end
 
 
 def is_in_sleep_window():
-    """检查是否在睡眠窗口 (02:00 - 06:00)"""
-    hour = now_cst().hour
-    return 2 <= hour < 6
+    """检查是否在睡眠窗口 (02:00:00 - 06:00:00)"""
+    now = now_cst()
+    current = now.hour * 3600 + now.minute * 60 + now.second
+    sleep_start = 2 * 3600  # 02:00:00
+    sleep_end = 6 * 3600    # 06:00:00
+    return sleep_start <= current < sleep_end
 
 
 # ====== Redis 队列管理 ======
@@ -102,7 +194,7 @@ def init_queue(accounts):
         pipe.zadd("pending", {phone: 0})
 
     pipe.execute()
-    print(f"队列初始化完成: {len(accounts)} 个账号")
+    logger.info(f"队列初始化完成: {len(accounts)} 个账号")
 
 
 def check_queue_date():
@@ -133,13 +225,25 @@ def generate_schedule():
     config = load_config()
     accounts = config["accounts"]
 
-    # 初始化队列
-    init_queue(accounts)
+    # 检查是否已经初始化过今天
+    queue_date = r.get("queue_date")
+    today = today_str()
 
-    # 获取所有待处理账号
-    pending = r.zrange("pending", 0, -1)
+    if queue_date == today:
+        # 已经初始化过，只清空调度表和重试队列，保留执行记录
+        logger.info("今日已初始化，重新生成调度表（保留执行记录）")
+        r.delete("schedule", "retry_queue")
+        # 获取未完成的账号（pending + retry）
+        pending = r.zrange("pending", 0, -1)
+        retry_phones = r.zrange("retry_queue", 0, -1)
+        pending = pending + retry_phones
+    else:
+        # 新的一天，完整初始化
+        logger.info("新的一天，完整初始化队列")
+        init_queue(accounts)
+        pending = r.zrange("pending", 0, -1)
     if not pending:
-        print("没有待处理账号")
+        logger.info("没有待处理账号")
         return
 
     # 随机打乱
@@ -153,6 +257,10 @@ def generate_schedule():
         batch = pending[i:i + size]
         batches.append(batch)
         i += size
+
+    if not batches:
+        logger.info("切分后没有批次")
+        return
 
     # 获取时间窗口
     start, end = get_day_window()
@@ -176,10 +284,10 @@ def generate_schedule():
         })
         pipe.zadd("schedule", {batch_data: execute_time.timestamp()})
 
-        print(f"批次 {idx + 1}: {len(batch)} 个账号, 执行时间 {execute_time.strftime('%H:%M')}")
+        logger.info(f"批次 {idx + 1}: {len(batch)} 个账号, 执行时间 {execute_time.strftime('%H:%M')}")
 
     pipe.execute()
-    print(f"\n调度表生成完成: {len(batches)} 个批次")
+    logger.info(f"调度表生成完成: {len(batches)} 个批次")
 
 
 def generate_retry_schedule():
@@ -187,7 +295,7 @@ def generate_retry_schedule():
     r = get_redis()
     retry_phones = r.zrange("retry_queue", 0, -1)
     if not retry_phones:
-        print("没有需要重试的账号")
+        logger.info("没有需要重试的账号")
         return
 
     # 随机打乱
@@ -223,12 +331,12 @@ def generate_retry_schedule():
         })
         pipe.zadd("schedule", {batch_data: execute_time.timestamp()})
 
-        print(f"重试批次 {idx + 1}: {len(batch)} 个账号, 执行时间 {execute_time.strftime('%H:%M')}")
+        logger.info(f"重试批次 {idx + 1}: {len(batch)} 个账号, 执行时间 {execute_time.strftime('%H:%M')}")
 
     # 清空 retry_queue
     pipe.delete("retry_queue")
     pipe.execute()
-    print(f"\n重试调度表生成完成: {len(batches)} 个批次")
+    logger.info(f"重试调度表生成完成: {len(batches)} 个批次")
 
 
 def check_new_accounts():
@@ -236,6 +344,7 @@ def check_new_accounts():
     r = get_redis()
     config = load_config()
     all_accounts = set(config["accounts"])
+    today = today_str()
 
     # 获取已在调度表和已完成/放弃的账号
     scheduled_phones = set()
@@ -246,19 +355,41 @@ def check_new_accounts():
     done_phones = r.smembers("done")
     giveup_phones = r.smembers("giveup")
     retry_phones = set(r.zrange("retry_queue", 0, -1))
+    # 获取今天已处理过的新账号
+    processed_key = f"processed_new:{today}"
+    processed_phones = r.smembers(processed_key)
 
-    known_phones = scheduled_phones | done_phones | giveup_phones | retry_phones
+    known_phones = scheduled_phones | done_phones | giveup_phones | retry_phones | processed_phones
     new_phones = list(all_accounts - known_phones)
 
     if new_phones:
-        print(f"发现 {len(new_phones)} 个新账号: {', '.join(new_phones)}")
+        logger.info(f"发现 {len(new_phones)} 个新账号: {', '.join(new_phones)}")
+
+        # 原子标记这些账号为已处理（防止重复添加）
+        pipe = r.pipeline()
+        for phone in new_phones:
+            pipe.sadd(processed_key, phone)
+        pipe.expire(processed_key, 86400)  # 24小时过期
+        pipe.execute()
 
         # 计算剩余时间窗口
         now = now_cst()
-        end = now.replace(hour=DAY_END_HOUR, minute=DAY_END_MINUTE, second=0, microsecond=0)
-        if now >= end:
-            # 如果已过正常窗口，放到重试窗口
-            end = (now + timedelta(days=1)).replace(hour=RETRY_END_HOUR, minute=0, second=0, microsecond=0)
+
+        # 检查是否在睡眠窗口
+        if is_in_sleep_window():
+            # 在睡眠窗口内，调度到今天 06:00 之后
+            start = now.replace(hour=DAY_START_HOUR, minute=0, second=0, microsecond=0)
+            if start <= now:
+                start += timedelta(days=1)
+            end = now.replace(hour=DAY_END_HOUR, minute=DAY_END_MINUTE, second=0, microsecond=0)
+            if end <= start:
+                end += timedelta(days=1)
+            now = start  # 从 06:00 开始调度
+        else:
+            end = now.replace(hour=DAY_END_HOUR, minute=DAY_END_MINUTE, second=0, microsecond=0)
+            if now >= end:
+                # 如果已过正常窗口，放到重试窗口
+                end = (now + timedelta(days=1)).replace(hour=RETRY_END_HOUR, minute=0, second=0, microsecond=0)
 
         remaining_minutes = max(int((end - now).total_seconds() / 60), 10)
 
@@ -290,7 +421,7 @@ def check_new_accounts():
             })
             pipe.zadd("schedule", {batch_data: execute_time.timestamp()})
 
-            print(f"新账号批次 {idx + 1}: {len(batch)} 个账号, 执行时间 {execute_time.strftime('%H:%M')}")
+            logger.info(f"新账号批次 {idx + 1}: {len(batch)} 个账号, 执行时间 {execute_time.strftime('%H:%M')}")
 
         pipe.execute()
 
@@ -306,7 +437,7 @@ def get_proxies(num):
         if data.get("code") == "SUCCESS":
             return [item["server"] for item in data.get("data", [])]
     except Exception as e:
-        print(f"获取代理失败: {e}")
+        logger.error(f"获取代理失败: {e}")
     return []
 
 
@@ -478,10 +609,10 @@ def run_account(phone, user_agent="Mozilla/5.0", proxy=None):
     app_uuid = md5(str(uuid.uuid4()))
 
     def log(msg):
-        print(f"[{phone}] {msg}")
+        logger.info(f"[{phone}] {msg}")
         lines.append(msg)
 
-    print(f"[{phone}] 开始登录 (代理: {proxy})...")
+    logger.info(f"[{phone}] 开始登录 (代理: {proxy})...")
     sms_resp = get_sms_code(phone, app_uuid, user_agent, proxy)
     if sms_resp.get("code") != 200:
         raise Exception(f"获取验证码失败: {sms_resp}")
@@ -492,7 +623,7 @@ def run_account(phone, user_agent="Mozilla/5.0", proxy=None):
         raise Exception(f"登录失败: {login_resp}")
 
     token = login_resp["data"]["token"]
-    print(f"[{phone}] 登录成功")
+    logger.info(f"[{phone}] 登录成功")
 
     vip_info = get_sc_frame_user_vip(token, user_agent, proxy)
     vip_data = vip_info.get("data", {})
@@ -556,10 +687,10 @@ def run_batch(batch_phones, user_agents, proxies):
             try:
                 report = future.result(timeout=120)
                 results[phone] = (report, True)
-                print(f"[{phone}] 成功")
+                logger.info(f"[{phone}] 成功")
             except Exception as e:
                 results[phone] = (f"[{phone}] 失败: {e}", False)
-                print(f"[{phone}] 失败: {e}")
+                logger.error(f"[{phone}] 失败: {e}")
 
     return results
 
@@ -578,14 +709,14 @@ def execute_batch(batch_data):
     is_retry = data.get("is_retry", False)
 
     prefix = "重试批次" if is_retry else "批次"
-    print(f"\n{'='*50}")
-    print(f"执行{prefix} {batch_no}: {len(phones)} 个账号")
-    print(f"{'='*50}")
+    logger.info(f"{'='*50}")
+    logger.info(f"执行{prefix} {batch_no}: {len(phones)} 个账号")
+    logger.info(f"{'='*50}")
 
     # 获取代理
     proxies = get_proxies(len(phones))
     if len(proxies) < len(phones):
-        print(f"代理不足: 需要 {len(phones)} 个，只获取到 {len(proxies)} 个")
+        logger.warning(f"代理不足: 需要 {len(phones)} 个，只获取到 {len(proxies)} 个")
         proxies.extend([None] * (len(phones) - len(proxies)))
 
     # 执行
@@ -599,6 +730,9 @@ def execute_batch(batch_data):
     for phone in phones:
         report, success = results.get(phone, (f"[{phone}] 无结果", False))
 
+        # 从 pending 移除
+        r.zrem("pending", phone)
+
         if success:
             all_reports.append(report)
             r.rpush("reports", report)
@@ -606,19 +740,19 @@ def execute_batch(batch_data):
             success_count += 1
         else:
             fail_count += 1
-            print(f"[{phone}] 错误详情: {report}")
+            logger.error(f"[{phone}] 错误详情: {report}")
 
             # 失败的加入重试队列
             retry_count = r.hincrby("retry_count", phone, 1)
             if retry_count >= MAX_RETRY:
                 r.sadd("giveup", phone)
-                print(f"[{phone}] 已失败{retry_count}次，放弃")
+                logger.warning(f"[{phone}] 已失败{retry_count}次，放弃")
             else:
                 r.zadd("retry_queue", {phone: retry_count})
-                print(f"[{phone}] 已失败{retry_count}次，加入重试队列")
+                logger.warning(f"[{phone}] 已失败{retry_count}次，加入重试队列")
 
     # 批次汇总
-    print(f"\n{prefix} {batch_no} 完成: 成功 {success_count} | 失败 {fail_count}")
+    logger.info(f"{prefix} {batch_no} 完成: 成功 {success_count} | 失败 {fail_count}")
 
     return all_reports
 
@@ -657,9 +791,9 @@ def send_daily_report():
 
     try:
         send_email(subject, email_body, email_config)
-        print(f"\n邮件已发送至 {email_config['receiver']}")
+        logger.info(f"邮件已发送至 {email_config['receiver']}")
     except Exception as e:
-        print(f"\n邮件发送失败: {e}")
+        logger.error(f"邮件发送失败: {e}")
 
 
 # ====== 心跳循环 ======
@@ -669,27 +803,40 @@ def tick_loop():
     r = get_redis()
     last_check_date = None
     last_new_account_check = 0
+    retry_schedule_generated = None  # 记录已生成重试调度表的日期
 
-    print(f"[{now_cst().strftime('%Y-%m-%d %H:%M:%S')}] 心跳循环启动，间隔 {TICK_INTERVAL} 秒")
+    logger.info(f"[{now_cst().strftime('%Y-%m-%d %H:%M:%S')}] 心跳循环启动，间隔 {TICK_INTERVAL} 秒")
 
     while True:
         now = now_cst()
         current_date = today_str()
 
-        # 检查是否需要生成新的调度表（新的一天）
+        # 检查是否需要生成新的调度表
         if current_date != last_check_date:
             if not is_in_sleep_window():
-                print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] 新的一天，生成调度表")
-                generate_schedule()
+                # 清理旧日志
+                cleanup_old_logs()
+
+                # 检查是否已有今天的调度表
+                schedule_size = r.zcard("schedule")
+                queue_date = r.get("queue_date")
+
+                if queue_date == current_date and schedule_size > 0:
+                    logger.info(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 今日调度表已存在，继续执行")
+                else:
+                    logger.info(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 生成调度表")
+                    generate_schedule()
+
                 last_check_date = current_date
 
-        # 检查是否需要生成重试调度表（23:30）
-        if now.hour == 23 and now.minute >= 30:
+        # 检查是否需要生成重试调度表（23:30，每天只生成一次）
+        if now.hour == 23 and now.minute >= 30 and retry_schedule_generated != current_date:
             retry_queue_size = r.zcard("retry_queue")
             schedule_size = r.zcard("schedule")
             if retry_queue_size > 0 and schedule_size == 0:
-                print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] 生成重试调度表")
+                logger.info(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 生成重试调度表")
                 generate_retry_schedule()
+                retry_schedule_generated = current_date
 
         # 检查新增账号（每5分钟）
         if time.time() - last_new_account_check > 300:
@@ -707,7 +854,7 @@ def tick_loop():
                         execute_batch(task)
                         r.zrem("schedule", task)
                     except Exception as e:
-                        print(f"执行批次失败: {e}")
+                        logger.error(f"执行批次失败: {e}")
                         r.zrem("schedule", task)
 
         # 检查是否所有任务完成
@@ -717,15 +864,12 @@ def tick_loop():
 
         if pending == 0 and retry == 0 and schedule == 0 and last_check_date == current_date:
             done = r.scard("done")
-            if done > 0:
-                print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] 今日任务全部完成")
+            # 使用 SETNX 原子操作，防止重复发送邮件
+            if done > 0 and r.setnx(f"report_sent:{current_date}", "1"):
+                r.expire(f"report_sent:{current_date}", 86400)  # 24小时过期
+                logger.info(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 今日任务全部完成")
                 send_daily_report()
-                # 等待到明天
-                tomorrow = (now + timedelta(days=1)).replace(hour=DAY_START_HOUR, minute=0, second=0, microsecond=0)
-                wait_seconds = (tomorrow - now).total_seconds()
-                print(f"下次执行: {tomorrow.strftime('%Y-%m-%d %H:%M:%S')}")
-                time.sleep(max(wait_seconds, 60))
-                continue
+                logger.info(f"等待明日任务，或监听随时新增的账号...")
 
         time.sleep(TICK_INTERVAL)
 
@@ -749,34 +893,46 @@ def main():
 
     if "--status" in sys.argv:
         status = get_queue_status()
-        print(f"待处理: {status['pending']} | 已完成: {status['done']} | 已放弃: {status['giveup']} | 重试: {status['retry']} | 调度中: {status['schedule']}")
+        logger.info(f"待处理: {status['pending']} | 已完成: {status['done']} | 已放弃: {status['giveup']} | 重试: {status['retry']} | 调度中: {status['schedule']}")
 
         r = get_redis()
         # 显示调度表
         schedule = r.zrange("schedule", 0, -1, withscores=True)
         if schedule:
-            print("\n调度表:")
+            logger.info("调度表:")
             for item, timestamp in schedule:
                 data = json.loads(item)
                 execute_time = datetime.fromtimestamp(timestamp, tz=CST)
                 phones = data["phones"]
                 prefix = "重试" if data.get("is_retry") else ""
-                print(f"  {execute_time.strftime('%H:%M')} - {prefix}批次{data['batch_no']}: {len(phones)} 个账号")
+                logger.info(f"  {execute_time.strftime('%H:%M')} - {prefix}批次{data['batch_no']}: {len(phones)} 个账号")
         return
 
     if "--clear" in sys.argv:
         r = get_redis()
         r.flushdb()
-        print("Redis 数据已清空")
+        logger.info("Redis 数据已清空")
         return
 
     if "--add" in sys.argv:
         phones = sys.argv[sys.argv.index("--add") + 1:]
         if not phones:
-            print("用法: python run_proxy.py --add 13800138000 13900139000")
+            logger.info("用法: python run_proxy.py --add 13800138000 13900139000")
             return
 
-        # 添加到 pending
+        # 更新 config.json
+        config = load_config()
+        existing = set(config.get("accounts", []))
+        new_phones = [p for p in phones if p not in existing]
+        if new_phones:
+            config["accounts"].extend(new_phones)
+            with open("config.json", "w") as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+            logger.info(f"config.json 已更新，新增 {len(new_phones)} 个账号")
+        else:
+            logger.info("所有账号已存在，无需更新 config.json")
+
+        # 添加到 Redis pending
         r = get_redis()
         for phone in phones:
             r.zadd("pending", {phone: 0})
@@ -785,7 +941,7 @@ def main():
         if r.zcard("schedule") > 0:
             check_new_accounts()
 
-        print(f"已添加 {len(phones)} 个账号: {', '.join(phones)}")
+        logger.info(f"已添加 {len(phones)} 个账号到队列: {', '.join(phones)}")
         return
 
     if "--generate" in sys.argv:

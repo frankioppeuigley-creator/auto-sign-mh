@@ -18,7 +18,7 @@ services:
       - REDIS_HOST=redis
     volumes:
       - ./config.json:/app/config.json
-      - ./queue.json:/app/queue.json
+      - ./logs:/app/logs
 
 volumes:
   redis_data:
