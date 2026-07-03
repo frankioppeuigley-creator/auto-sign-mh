@@ -81,8 +81,16 @@ console_handler.setLevel(logging.INFO)
 file_handler = DailyRotatingFileHandler(LOG_DIR, prefix="run_proxy")
 file_handler.setLevel(logging.INFO)
 
-# 日志格式
-formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+# 日志格式（使用北京时间）
+class CSTFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, tz=CST)
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.strftime('%Y-%m-%d %H:%M:%S')
+
+
+formatter = CSTFormatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 console_handler.setFormatter(formatter)
 file_handler.setFormatter(formatter)
 
@@ -100,9 +108,12 @@ MAX_RETRY = 3
 
 # 时间窗口配置
 DAY_START_HOUR = 6       # 每天开始执行时间
-DAY_END_HOUR = 23        # 正常执行结束时间（小时）
-DAY_END_MINUTE = 30      # 正常执行结束时间（分钟）
-RETRY_END_HOUR = 2       # 重试缓冲区结束时间（次日凌晨）
+DAY_END_HOUR = 17        # 正常执行结束时间（小时）
+DAY_END_MINUTE = 0       # 正常执行结束时间（分钟）
+RETRY_START_HOUR = 18    # 重试缓冲区开始时间（小时）
+RETRY_START_MINUTE = 0   # 重试缓冲区开始时间（分钟）
+RETRY_END_HOUR = 23      # 重试缓冲区结束时间（小时）
+RETRY_END_MINUTE = 59    # 重试缓冲区结束时间（分钟）
 BATCH_SIZE_MIN = 3       # 每批最少账号数
 BATCH_SIZE_MAX = 8       # 每批最多账号数
 TICK_INTERVAL = 30       # 心跳间隔（秒）
@@ -142,7 +153,7 @@ def today_str():
 
 
 def get_day_window():
-    """获取正常执行时间窗口 (06:00 - 23:30)"""
+    """获取正常执行时间窗口 (06:00 - 17:00)"""
     now = now_cst()
     start = now.replace(hour=DAY_START_HOUR, minute=0, second=0, microsecond=0)
     end = now.replace(hour=DAY_END_HOUR, minute=DAY_END_MINUTE, second=0, microsecond=0)
@@ -150,27 +161,18 @@ def get_day_window():
 
 
 def get_retry_window():
-    """获取重试缓冲区时间窗口 (23:30 - 次日02:00)"""
+    """获取重试缓冲区时间窗口 (18:00 - 23:59，不跨天)"""
     now = now_cst()
-    retry_end_today = now.replace(hour=RETRY_END_HOUR, minute=0, second=0, microsecond=0)
-
-    if now < retry_end_today:
-        # 当前时间在 00:00-01:59，重试窗口是昨天 23:30 到今天 02:00
-        start = (now - timedelta(days=1)).replace(hour=DAY_END_HOUR, minute=DAY_END_MINUTE, second=0, microsecond=0)
-        end = retry_end_today
-    else:
-        # 当前时间在 02:00 之后，重试窗口是今天 23:30 到明天 02:00
-        start = now.replace(hour=DAY_END_HOUR, minute=DAY_END_MINUTE, second=0, microsecond=0)
-        end = (now + timedelta(days=1)).replace(hour=RETRY_END_HOUR, minute=0, second=0, microsecond=0)
-
+    start = now.replace(hour=RETRY_START_HOUR, minute=RETRY_START_MINUTE, second=0, microsecond=0)
+    end = now.replace(hour=RETRY_END_HOUR, minute=RETRY_END_MINUTE, second=59, microsecond=0)
     return start, end
 
 
 def is_in_sleep_window():
-    """检查是否在睡眠窗口 (02:00:00 - 06:00:00)"""
+    """检查是否在睡眠窗口 (00:00:00 - 06:00:00)"""
     now = now_cst()
     current = now.hour * 3600 + now.minute * 60 + now.second
-    sleep_start = 2 * 3600  # 02:00:00
+    sleep_start = 0 * 3600  # 00:00:00
     sleep_end = 6 * 3600    # 06:00:00
     return sleep_start <= current < sleep_end
 
@@ -377,19 +379,15 @@ def check_new_accounts():
 
         # 检查是否在睡眠窗口
         if is_in_sleep_window():
-            # 在睡眠窗口内，调度到今天 06:00 之后
-            start = now.replace(hour=DAY_START_HOUR, minute=0, second=0, microsecond=0)
-            if start <= now:
-                start += timedelta(days=1)
-            end = now.replace(hour=DAY_END_HOUR, minute=DAY_END_MINUTE, second=0, microsecond=0)
-            if end <= start:
-                end += timedelta(days=1)
-            now = start  # 从 06:00 开始调度
-        else:
-            end = now.replace(hour=DAY_END_HOUR, minute=DAY_END_MINUTE, second=0, microsecond=0)
-            if now >= end:
-                # 如果已过正常窗口，放到重试窗口
-                end = (now + timedelta(days=1)).replace(hour=RETRY_END_HOUR, minute=0, second=0, microsecond=0)
+            # 在睡眠窗口内，不调度新任务
+            logger.info("在睡眠窗口内，跳过新账号调度")
+            return
+
+        end = now.replace(hour=RETRY_END_HOUR, minute=RETRY_END_MINUTE, second=59, microsecond=0)
+        if now >= end:
+            # 已过重试窗口，跳过
+            logger.info("已过今日执行窗口，跳过新账号调度")
+            return
 
         remaining_minutes = max(int((end - now).total_seconds() / 60), 10)
 
@@ -828,9 +826,10 @@ def tick_loop():
                     generate_schedule()
 
                 last_check_date = current_date
-
-        # 检查是否需要生成重试调度表（23:30，每天只生成一次）
-        if now.hour == 23 and now.minute >= 30 and retry_schedule_generated != current_date:
+        # 获取重试窗口的起始时间
+        retry_start, _ = get_retry_window()
+        # 检查是否需要生成重试调度表（18:00，每天只生成一次）
+        if now >= retry_start and retry_schedule_generated != current_date:
             retry_queue_size = r.zcard("retry_queue")
             schedule_size = r.zcard("schedule")
             if retry_queue_size > 0 and schedule_size == 0:
@@ -846,10 +845,12 @@ def tick_loop():
         # 检查是否有待执行的批次
         if not is_in_sleep_window():
             current_timestamp = now.timestamp()
-            tasks = r.zrangebyscore("schedule", "-inf", current_timestamp)
+            tasks = r.zrangebyscore("schedule", "-inf", current_timestamp, withscores=True)
 
             if tasks:
-                for task in tasks:
+                for task, scheduled_time in tasks:
+                    scheduled_dt = datetime.fromtimestamp(scheduled_time, tz=CST)
+                    logger.info(f"触发调度任务: 计划时间 {scheduled_dt.strftime('%H:%M:%S')}")
                     try:
                         execute_batch(task)
                         r.zrem("schedule", task)
