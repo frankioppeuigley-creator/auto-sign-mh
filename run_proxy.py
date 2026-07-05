@@ -801,7 +801,6 @@ def tick_loop():
     r = get_redis()
     last_check_date = None
     last_new_account_check = 0
-    retry_schedule_generated = None  # 记录已生成重试调度表的日期
 
     logger.info(f"[{now_cst().strftime('%Y-%m-%d %H:%M:%S')}] 心跳循环启动，间隔 {TICK_INTERVAL} 秒")
 
@@ -827,15 +826,14 @@ def tick_loop():
 
                 last_check_date = current_date
         # 获取重试窗口的起始时间
-        retry_start, _ = get_retry_window()
-        # 检查是否需要生成重试调度表（18:00，每天只生成一次）
-        if now >= retry_start and retry_schedule_generated != current_date:
+        retry_start, retry_end = get_retry_window()
+        # 检查是否需要生成重试调度表（18:00-23:59，每30分钟检查一次）
+        if retry_start <= now <= retry_end:
             retry_queue_size = r.zcard("retry_queue")
             schedule_size = r.zcard("schedule")
             if retry_queue_size > 0 and schedule_size == 0:
                 logger.info(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 生成重试调度表")
                 generate_retry_schedule()
-                retry_schedule_generated = current_date
 
         # 检查新增账号（每5分钟）
         if time.time() - last_new_account_check > 300:
@@ -863,12 +861,20 @@ def tick_loop():
         retry = r.zcard("retry_queue")
         schedule = r.zcard("schedule")
 
-        if pending == 0 and retry == 0 and schedule == 0 and last_check_date == current_date:
+        # 条件1: 所有任务完成（pending=0, retry=0, schedule=0）
+        # 条件2: 到达23:59，强制发送日报
+        all_done = pending == 0 and retry == 0 and schedule == 0
+        force_send = now.hour == 23 and now.minute >= 59
+
+        if (all_done or force_send) and last_check_date == current_date:
             done = r.scard("done")
             # 使用 SETNX 原子操作，防止重复发送邮件
             if done > 0 and r.setnx(f"report_sent:{current_date}", "1"):
                 r.expire(f"report_sent:{current_date}", 86400)  # 24小时过期
-                logger.info(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 今日任务全部完成")
+                if all_done:
+                    logger.info(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 今日任务全部完成")
+                else:
+                    logger.info(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] 到达23:59，强制发送日报（仍有 {retry} 个重试任务未完成）")
                 send_daily_report()
                 logger.info(f"等待明日任务，或监听随时新增的账号...")
 
