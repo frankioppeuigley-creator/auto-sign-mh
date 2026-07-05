@@ -10,9 +10,11 @@ import uuid
 import smtplib
 import redis
 import requests
+import pandas as pd
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 # 中国时区
 CST = timezone(timedelta(hours=8))
@@ -186,7 +188,7 @@ def init_queue(accounts):
     pipe = r.pipeline()
 
     # 清空旧数据
-    pipe.delete("pending", "done", "giveup", "retry_count", "retry_queue", "queue_date", "reports", "schedule")
+    pipe.delete("pending", "done", "giveup", "retry_count", "retry_queue", "queue_date", "reports", "schedule", "account_data")
 
     # 设置日期
     pipe.set("queue_date", today)
@@ -735,6 +737,11 @@ def execute_batch(batch_data):
             all_reports.append(report)
             r.rpush("reports", report)
             r.sadd("done", phone)
+
+            # 解析并存储结构化数据
+            account_data = parse_report(report)
+            r.rpush("account_data", json.dumps(account_data, ensure_ascii=False))
+
             success_count += 1
         else:
             fail_count += 1
@@ -753,6 +760,110 @@ def execute_batch(batch_data):
     logger.info(f"{prefix} {batch_no} 完成: 成功 {success_count} | 失败 {fail_count}")
 
     return all_reports
+
+
+# ====== 报告解析 ======
+
+def parse_report(report):
+    """解析报告字符串，提取结构化数据"""
+    lines = report.split("\n")
+    data = {
+        "账号": "",
+        "抽奖券(张)": 0,
+        "增加积分": 0,
+        "积分余额": 0,
+        "零钱余额": 0
+    }
+
+    for line in lines:
+        line = line.strip()
+        if line.startswith("账号:"):
+            # 格式: "账号: 13800138000 (张三)"
+            data["账号"] = line.split("(")[0].replace("账号:", "").strip()
+        elif line.startswith("抽奖券:"):
+            # 格式: "抽奖券: 3 张"
+            data["抽奖券(张)"] = int(line.split(":")[1].replace("张", "").strip())
+        elif "积分" in line and ":" in line and "券" in line:
+            # 格式: "  券123: 36积分"
+            if "谢谢参与" not in line:
+                try:
+                    points = int(line.split(":")[1].replace("积分", "").strip())
+                    data["增加积分"] += points
+                except ValueError:
+                    pass
+        elif line.startswith("积分:"):
+            # 格式: "积分: 500 | 零钱: 10"
+            parts = line.split("|")
+            try:
+                data["积分余额"] = int(parts[0].replace("积分:", "").strip())
+                data["零钱余额"] = float(parts[1].replace("零钱:", "").strip())
+            except (ValueError, IndexError):
+                pass
+
+    return data
+
+
+def generate_html_table(account_data_list):
+    """使用 pandas 生成 HTML 表格"""
+    if not account_data_list:
+        return "<p>无数据</p>"
+
+    # 解析所有数据
+    data_list = []
+    for data_json in account_data_list:
+        data = json.loads(data_json)
+        data_list.append(data)
+
+    # 创建 DataFrame
+    df = pd.DataFrame(data_list)
+
+    # 添加序号列
+    df.insert(0, '序号', range(1, len(df) + 1))
+
+    # 计算汇总行
+    summary = {
+        '序号': '合计',
+        '账号': f'{len(df)} 个账号',
+        '抽奖券(张)': df['抽奖券(张)'].sum(),
+        '增加积分': df['增加积分'].sum(),
+        '积分余额': df['积分余额'].sum(),
+        '零钱余额': df['零钱余额'].sum()
+    }
+    df = pd.concat([df, pd.DataFrame([summary])], ignore_index=True)
+
+    # 生成 HTML 表格
+    html = df.to_html(index=False, classes='table', border=1, justify='center')
+
+    # 添加样式
+    styled_html = """
+    <style>
+        .table {
+            border-collapse: collapse;
+            width: 100%;
+            font-family: Arial, sans-serif;
+        }
+        .table th {
+            background-color: #4CAF50;
+            color: white;
+            padding: 12px;
+            text-align: center;
+        }
+        .table td {
+            padding: 10px;
+            text-align: center;
+            border-bottom: 1px solid #ddd;
+        }
+        .table tr:hover {
+            background-color: #f5f5f5;
+        }
+        .table tr:last-child {
+            background-color: #e8f5e9;
+            font-weight: bold;
+        }
+    </style>
+    """ + html
+
+    return styled_html
 
 
 # ====== 邮件发送 ======
@@ -779,16 +890,46 @@ def send_daily_report():
     done_count = r.scard("done")
     giveup_count = r.scard("giveup")
 
-    # 获取所有报告
-    reports = r.lrange("reports", 0, -1)
-    email_body = "\n\n".join(reports)
+    # 获取结构化数据
+    account_data_list = r.lrange("account_data", 0, -1)
 
+    # 生成 HTML 表格
+    html_table = generate_html_table(account_data_list)
+
+    # 构建 HTML 邮件正文
     subject = f"抽奖日报 {today} (完成{done_count}/{total})"
     if giveup_count:
         subject += f" [放弃{giveup_count}]"
 
+    html_body = f"""
+    <html>
+    <head>
+        <meta charset="utf-8">
+    </head>
+    <body>
+        <h2 style="color: #333;">抽奖日报 {today}</h2>
+        <p style="color: #666;">完成: {done_count}/{total} | 放弃: {giveup_count}</p>
+        {html_table}
+        <br>
+        <p style="color: #999; font-size: 12px;">此邮件由自动签到脚本发送</p>
+    </body>
+    </html>
+    """
+
     try:
-        send_email(subject, email_body, email_config)
+        # 发送 HTML 邮件
+        msg = MIMEMultipart('alternative')
+        msg["Subject"] = subject
+        msg["From"] = email_config["sender"]
+        msg["To"] = email_config["receiver"]
+
+        html_part = MIMEText(html_body, "html", "utf-8")
+        msg.attach(html_part)
+
+        with smtplib.SMTP_SSL(email_config["smtp_server"], email_config["smtp_port"]) as server:
+            server.login(email_config["sender"], email_config["auth_code"])
+            server.sendmail(email_config["sender"], email_config["receiver"], msg.as_string())
+
         logger.info(f"邮件已发送至 {email_config['receiver']}")
     except Exception as e:
         logger.error(f"邮件发送失败: {e}")
