@@ -118,6 +118,8 @@ RETRY_END_HOUR = 23      # 重试缓冲区结束时间（小时）
 RETRY_END_MINUTE = 59    # 重试缓冲区结束时间（分钟）
 BATCH_SIZE_MIN = 3       # 每批最少账号数
 BATCH_SIZE_MAX = 8       # 每批最多账号数
+MAX_CONCURRENT = 3       # 最大并发线程数
+ACCOUNT_DELAY = 2        # 账号间隔（秒）
 TICK_INTERVAL = 30       # 心跳间隔（秒）
 
 # Redis 配置
@@ -604,9 +606,15 @@ def lottery_winner(auth_token, user_coupon_id, lottery_type=10, code=100, text="
 
 # ====== 单账号完整流程 ======
 
-def run_account(phone, user_agent="Mozilla/5.0", proxy=None):
+def run_account(phone, user_agent="Mozilla/5.0"):
     lines = []
     app_uuid = md5(str(uuid.uuid4()))
+
+    # 在线程内获取代理（代理存活时间只有1分钟）
+    proxies = get_proxies(1)
+    proxy = proxies[0] if proxies else None
+    if not proxy:
+        logger.warning(f"[{phone}] 获取代理失败，使用本地IP")
 
     def log(msg):
         logger.info(f"[{phone}] {msg}")
@@ -671,16 +679,19 @@ def run_account(phone, user_agent="Mozilla/5.0", proxy=None):
 
 # ====== 并发执行一批 ======
 
-def run_batch(batch_phones, user_agents, proxies):
+def run_batch(batch_phones, user_agents):
     """并发执行一批账号"""
     results = {}
+    max_workers = min(len(batch_phones), MAX_CONCURRENT)
 
-    with ThreadPoolExecutor(max_workers=len(batch_phones)) as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {}
         for i, phone in enumerate(batch_phones):
             ua = random.choice(user_agents)
-            proxy = proxies[i] if i < len(proxies) else None
-            futures[executor.submit(run_account, phone, ua, proxy)] = phone
+            futures[executor.submit(run_account, phone, ua)] = phone
+            # 账号间隔，避免同时获取代理
+            if i < len(batch_phones) - 1:
+                time.sleep(ACCOUNT_DELAY)
 
         for future in as_completed(futures):
             phone = futures[future]
@@ -710,17 +721,11 @@ def execute_batch(batch_data):
 
     prefix = "重试批次" if is_retry else "批次"
     logger.info(f"{'='*50}")
-    logger.info(f"执行{prefix} {batch_no}: {len(phones)} 个账号")
+    logger.info(f"执行{prefix} {batch_no}: {len(phones)} 个账号 (最大并发: {min(len(phones), MAX_CONCURRENT)})")
     logger.info(f"{'='*50}")
 
-    # 获取代理
-    proxies = get_proxies(len(phones))
-    if len(proxies) < len(phones):
-        logger.warning(f"代理不足: 需要 {len(phones)} 个，只获取到 {len(proxies)} 个")
-        proxies.extend([None] * (len(phones) - len(proxies)))
-
-    # 执行
-    results = run_batch(phones, user_agents, proxies)
+    # 执行（代理在线程内获取，因为代理存活时间只有1分钟）
+    results = run_batch(phones, user_agents)
 
     # 处理结果
     success_count = 0
