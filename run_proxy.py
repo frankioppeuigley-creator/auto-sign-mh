@@ -120,6 +120,8 @@ BATCH_SIZE_MIN = 3       # 每批最少账号数
 BATCH_SIZE_MAX = 8       # 每批最多账号数
 MAX_CONCURRENT = 3       # 最大并发线程数
 ACCOUNT_DELAY = 2        # 账号间隔（秒）
+LOTTERY_DELAY_MIN = 3    # 抽奖间隔最小（秒）
+LOTTERY_DELAY_MAX = 5    # 抽奖间隔最大（秒）
 TICK_INTERVAL = 30       # 心跳间隔（秒）
 
 # Redis 配置
@@ -657,7 +659,7 @@ def run_account(phone, user_agent="Mozilla/5.0"):
     coupon_list = coupons.get("data", [])
     log(f"抽奖券: {len(coupon_list)} 张")
 
-    for coupon in coupon_list:
+    for idx, coupon in enumerate(coupon_list):
         cid = coupon["user_coupon_id"]
         try:
             result = lottery_winner(token, user_coupon_id=format(cid, 'x'), user_agent=user_agent, proxy=proxy)
@@ -667,6 +669,9 @@ def run_account(phone, user_agent="Mozilla/5.0"):
             log(f"  券{cid}: {prize}")
         except Exception as e:
             log(f"  券{cid}: {e}")
+        # 抽奖间隔，避免请求过快
+        if idx < len(coupon_list) - 1:
+            time.sleep(random.randint(LOTTERY_DELAY_MIN, LOTTERY_DELAY_MAX))
 
     extra_pay = list_extra_pay(token, uniapp_device_no or app_uuid, user_agent, proxy)
     pay_data = extra_pay.get("data", [])
