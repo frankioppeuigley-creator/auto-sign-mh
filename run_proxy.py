@@ -1102,6 +1102,64 @@ def main():
         logger.info(f"已添加 {len(phones)} 个账号到队列: {', '.join(phones)}")
         return
 
+    if "--delete" in sys.argv:
+        phones = sys.argv[sys.argv.index("--delete") + 1:]
+        if not phones:
+            logger.info("用法: python run_proxy.py --delete 13800138000 13900139000")
+            return
+
+        r = get_redis()
+        phone_set = set(phones)
+
+        # 从 config.json 移除
+        config = load_config()
+        existing = set(config.get("accounts", []))
+        removed_from_config = existing & phone_set
+        if removed_from_config:
+            config["accounts"] = [p for p in config["accounts"] if p not in phone_set]
+            with open("config.json", "w") as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+            logger.info(f"config.json 已更新，移除 {len(removed_from_config)} 个账号")
+        else:
+            logger.info("config.json 中未找到指定账号")
+
+        # 从 Redis 各队列移除
+        pipe = r.pipeline()
+        for phone in phones:
+            pipe.zrem("pending", phone)
+            pipe.srem("done", phone)
+            pipe.srem("giveup", phone)
+            pipe.zrem("retry_queue", phone)
+            pipe.hdel("retry_count", phone)
+        pipe.execute()
+
+        # 从调度表中移除：遍历 schedule，找到包含目标账号的批次
+        schedule_items = r.zrange("schedule", 0, -1, withscores=True)
+        removed_from_schedule = 0
+        for batch_json, score in schedule_items:
+            data = json.loads(batch_json)
+            batch_phones = set(data["phones"])
+            if batch_phones & phone_set:
+                # 从批次中移除目标账号
+                remaining = [p for p in data["phones"] if p not in phone_set]
+                if remaining:
+                    # 批次还有剩余账号，更新
+                    data["phones"] = remaining
+                    new_json = json.dumps(data, ensure_ascii=False)
+                    pipe = r.pipeline()
+                    pipe.zrem("schedule", batch_json)
+                    pipe.zadd("schedule", {new_json: score})
+                    pipe.execute()
+                else:
+                    # 批次已空，直接删除
+                    r.zrem("schedule", batch_json)
+                removed_from_schedule += 1
+
+        logger.info(f"已删除 {len(phones)} 个账号: {', '.join(phones)}")
+        logger.info(f"  config.json: 移除 {len(removed_from_config)} 个")
+        logger.info(f"  调度表: 处理 {removed_from_schedule} 个批次")
+        return
+
     if "--generate" in sys.argv:
         generate_schedule()
         return
