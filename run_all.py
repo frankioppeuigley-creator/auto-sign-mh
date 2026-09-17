@@ -154,22 +154,17 @@ def click_share(auth_token, user_vip_id, sys_component_tpl_id="744", user_agent=
     return post("/operations/clickShare", data, auth_token=auth_token, user_agent=user_agent)
 
 
-def list_user_lottery_coupon(auth_token, lottery_type=10, user_agent="Mozilla/5.0"):
+def get_lottery(auth_token, lottery_type=30, user_agent="Mozilla/5.0"):
+    return post("/lottery/getLottery", {"lottery_type": lottery_type}, auth_token=auth_token, user_agent=user_agent)
+
+
+def list_user_lottery_coupon(auth_token, lottery_type=30, user_agent="Mozilla/5.0"):
     return post("/lottery/listUserLotteryCoupon", {"lottery_type": lottery_type}, auth_token=auth_token, user_agent=user_agent)
 
 
-def lottery_winner(auth_token, user_coupon_id, lottery_type=10, code=100, text="优惠券", count=3, user_agent="Mozilla/5.0"):
+def lottery_winner(auth_token, condition, lottery_type=30, user_agent="Mozilla/5.0"):
     data = {
-        "condition": {
-            "code": code,
-            "text": text,
-            "key": f"lottery_item_type_{code}",
-            "checkbox": 1,
-            "value": "",
-            "couponList": None,
-            "count": count,
-            "user_coupon_id": user_coupon_id,
-        },
+        "condition": condition,
         "lottery_type": lottery_type,
     }
     return post("/lottery/winner", data, auth_token=auth_token, user_agent=user_agent)
@@ -223,24 +218,43 @@ def run_account(phone, user_agent="Mozilla/5.0"):
             click_share(token, user_vip_id, user_agent=user_agent)
             lines.append("分享: 已完成")
 
-        # 5. 获取券列表
-        coupons = list_user_lottery_coupon(token, user_agent=user_agent)
-        coupon_list = coupons.get("data", [])
-        lines.append(f"抽奖券: {len(coupon_list)} 张")
+        # 5. 获取当前抽奖活动
+        lottery_info = get_lottery(token, user_agent=user_agent)
+        lottery_data = lottery_info.get("data")
 
-        # 6. 逐个抽奖
-        if coupon_list:
-            for idx, coupon in enumerate(coupon_list):
-                cid = coupon["user_coupon_id"]
-                try:
-                    result = lottery_winner(token, user_coupon_id=format(cid, 'x'), user_agent=user_agent)
-                    data = result.get("data")
-                    prize = data.get("item", {}).get("item_caption", "谢谢参与") if isinstance(data, dict) and data.get("item") else "谢谢参与"
-                    lines.append(f"  券{cid}: {prize}")
-                except Exception as e:
-                    lines.append(f"  券{cid}: 异常 {e}")
-                if idx < len(coupon_list) - 1:
-                    time.sleep(2)
+        if not lottery_data or not isinstance(lottery_data, dict):
+            lines.append("抽奖: 无进行中的活动")
+        else:
+            # 从 condition_json 中找 code=100 的抽奖条件
+            condition_json = lottery_data.get("condition_json", [])
+            coupon_condition = next((c for c in condition_json if c.get("code") == 100), None)
+
+            if not coupon_condition:
+                lines.append("抽奖: 无券抽奖配置")
+            else:
+                # 获取用户可用的抽奖券
+                coupons = list_user_lottery_coupon(token, user_agent=user_agent)
+                coupon_list = coupons.get("data", [])
+                lines.append(f"抽奖券: {len(coupon_list)} 张")
+
+                # 逐个抽奖
+                if coupon_list:
+                    for idx, coupon in enumerate(coupon_list):
+                        cid = coupon["user_coupon_id"]
+                        try:
+                            cond = {
+                                **coupon_condition,
+                                "couponList": None,
+                                "user_coupon_id": format(cid, 'x'),
+                            }
+                            result = lottery_winner(token, condition=cond, user_agent=user_agent)
+                            data = result.get("data")
+                            prize = data.get("item", {}).get("item_caption", "谢谢参与") if isinstance(data, dict) and data.get("item") else "谢谢参与"
+                            lines.append(f"  券{cid}: {prize}")
+                        except Exception as e:
+                            lines.append(f"  券{cid}: 异常 {e}")
+                        if idx < len(coupon_list) - 1:
+                            time.sleep(2)
 
         # 7. 查余额
         extra_pay = list_extra_pay(token, uniapp_device_no or app_uuid, user_agent)

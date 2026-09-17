@@ -583,24 +583,19 @@ def click_share(auth_token, user_vip_id, sys_component_tpl_id="744", user_agent=
     return post("/operations/clickShare", data, auth_token=auth_token, user_agent=user_agent, proxy=proxy)
 
 
-def list_user_lottery_coupon(auth_token, lottery_type=10, user_agent="Mozilla/5.0", proxy=None):
+def get_lottery(auth_token, lottery_type=30, user_agent="Mozilla/5.0", proxy=None):
+    return post("/lottery/getLottery", {"lottery_type": lottery_type},
+                auth_token=auth_token, user_agent=user_agent, proxy=proxy)
+
+
+def list_user_lottery_coupon(auth_token, lottery_type=30, user_agent="Mozilla/5.0", proxy=None):
     return post("/lottery/listUserLotteryCoupon", {"lottery_type": lottery_type},
                 auth_token=auth_token, user_agent=user_agent, proxy=proxy)
 
 
-def lottery_winner(auth_token, user_coupon_id, lottery_type=10, code=100, text="优惠券", count=3,
-                   user_agent="Mozilla/5.0", proxy=None):
+def lottery_winner(auth_token, condition, lottery_type=30, user_agent="Mozilla/5.0", proxy=None):
     data = {
-        "condition": {
-            "code": code,
-            "text": text,
-            "key": f"lottery_item_type_{code}",
-            "checkbox": 1,
-            "value": "",
-            "couponList": None,
-            "count": count,
-            "user_coupon_id": user_coupon_id,
-        },
+        "condition": condition,
         "lottery_type": lottery_type,
     }
     return post("/lottery/winner", data, auth_token=auth_token, user_agent=user_agent, proxy=proxy)
@@ -655,23 +650,44 @@ def run_account(phone, user_agent="Mozilla/5.0"):
         click_share(token, user_vip_id, user_agent=user_agent, proxy=proxy)
         log("分享: 已完成")
 
-    coupons = list_user_lottery_coupon(token, user_agent=user_agent, proxy=proxy)
-    coupon_list = coupons.get("data", [])
-    log(f"抽奖券: {len(coupon_list)} 张")
+    # 获取当前抽奖活动信息
+    lottery_info = get_lottery(token, user_agent=user_agent, proxy=proxy)
+    lottery_data = lottery_info.get("data")
 
-    for idx, coupon in enumerate(coupon_list):
-        cid = coupon["user_coupon_id"]
-        try:
-            result = lottery_winner(token, user_coupon_id=format(cid, 'x'), user_agent=user_agent, proxy=proxy)
-            data = result.get("data")
-            prize = data.get("item", {}).get("item_caption", "谢谢参与") if isinstance(data, dict) and data.get(
-                "item") else "谢谢参与"
-            log(f"  券{cid}: {prize}")
-        except Exception as e:
-            log(f"  券{cid}: {e}")
-        # 抽奖间隔，避免请求过快
-        if idx < len(coupon_list) - 1:
-            time.sleep(random.randint(LOTTERY_DELAY_MIN, LOTTERY_DELAY_MAX))
+    if not lottery_data or not isinstance(lottery_data, dict):
+        log("抽奖: 无进行中的活动")
+    else:
+        # 从 condition_json 中找 code=100 的抽奖条件
+        condition_json = lottery_data.get("condition_json", [])
+        coupon_condition = next((c for c in condition_json if c.get("code") == 100), None)
+
+        if not coupon_condition:
+            log("抽奖: 无券抽奖配置")
+        else:
+            # 获取用户可用的抽奖券
+            coupons = list_user_lottery_coupon(token, user_agent=user_agent, proxy=proxy)
+            coupon_list = coupons.get("data", [])
+            log(f"抽奖券: {len(coupon_list)} 张")
+
+            for idx, coupon in enumerate(coupon_list):
+                cid = coupon["user_coupon_id"]
+                try:
+                    # 构造请求参数：基于活动返回的 condition，填入当前券的 user_coupon_id
+                    cond = {
+                        **coupon_condition,
+                        "couponList": None,
+                        "user_coupon_id": format(cid, 'x'),
+                    }
+                    result = lottery_winner(token, condition=cond, user_agent=user_agent, proxy=proxy)
+                    data = result.get("data")
+                    prize = data.get("item", {}).get("item_caption", "谢谢参与") if isinstance(data, dict) and data.get(
+                        "item") else "谢谢参与"
+                    log(f"  券{cid}: {prize}")
+                except Exception as e:
+                    log(f"  券{cid}: {e}")
+                # 抽奖间隔，避免请求过快
+                if idx < len(coupon_list) - 1:
+                    time.sleep(random.randint(LOTTERY_DELAY_MIN, LOTTERY_DELAY_MAX))
 
     extra_pay = list_extra_pay(token, uniapp_device_no or app_uuid, user_agent, proxy)
     pay_data = extra_pay.get("data", [])
